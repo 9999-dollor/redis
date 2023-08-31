@@ -62,8 +62,8 @@ proc sanitizer_errors_from_file {filename} {
         }
 
         # GCC UBSAN output does not contain 'Sanitizer' but 'runtime error'.
-        if {[string match {*runtime error*} $log] ||
-            [string match {*Sanitizer*} $log]} {
+        if {[string match {*runtime error*} $line] ||
+            [string match {*Sanitizer*} $line]} {
             return $log
         }
     }
@@ -637,7 +637,7 @@ proc get_child_pid {idx} {
 }
 
 proc process_is_alive pid {
-    if {[catch {exec ps -p $pid} err]} {
+    if {[catch {exec ps -p $pid -f} err]} {
         return 0
     } else {
         if {[string match "*<defunct>*" $err]} { return 0 }
@@ -1106,3 +1106,12 @@ proc lmap args {
     }
     set temp
 }
+
+proc format_command {args} {
+    set cmd "*[llength $args]\r\n"
+    foreach a $args {
+        append cmd "$[string length $a]\r\n$a\r\n"
+    }
+    set _ $cmd
+}
+

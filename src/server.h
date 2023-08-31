@@ -53,7 +53,6 @@
 #include <sys/socket.h>
 #include <lua.h>
 #include <signal.h>
-#include "hdr_histogram.h"
 
 #ifdef HAVE_LIBSYSTEMD
 #include <systemd/sd-daemon.h>
@@ -91,6 +90,8 @@ typedef struct redisObject robj;
 #include "sha1.h"
 #include "endianconv.h"
 #include "crc64.h"
+
+struct hdr_histogram;
 
 /* helpers */
 #define numElements(x) (sizeof(x)/sizeof((x)[0]))
@@ -167,7 +168,9 @@ typedef struct redisObject robj;
 #define STATS_METRIC_NET_OUTPUT 2   /* Bytes written to network. */
 #define STATS_METRIC_NET_INPUT_REPLICATION 3   /* Bytes read to network during replication. */
 #define STATS_METRIC_NET_OUTPUT_REPLICATION 4   /* Bytes written to network during replication. */
-#define STATS_METRIC_COUNT 5
+#define STATS_METRIC_EL_CYCLE 5     /* Number of eventloop cycled. */
+#define STATS_METRIC_EL_DURATION 6  /* Eventloop duration. */
+#define STATS_METRIC_COUNT 7
 
 /* Protocol and I/O related defines */
 #define PROTO_IOBUF_LEN         (1024*16)  /* Generic I/O buffer size */
@@ -504,6 +507,7 @@ typedef enum {
 #define LL_VERBOSE 1
 #define LL_NOTICE 2
 #define LL_WARNING 3
+#define LL_NOTHING 4
 #define LL_RAW (1<<10) /* Modifier to log without timestamp */
 
 /* Supervision options */
@@ -517,6 +521,7 @@ typedef enum {
 
 #define ZSKIPLIST_MAXLEVEL 32 /* Should be enough for 2^64 elements */
 #define ZSKIPLIST_P 0.25      /* Skiplist P = 1/4 */
+#define ZSKIPLIST_MAX_SEARCH 10
 
 /* Append only defines */
 #define AOF_FSYNC_NO 0
@@ -588,9 +593,9 @@ typedef enum {
 #define CMD_CALL_PROPAGATE_AOF (1<<0)
 #define CMD_CALL_PROPAGATE_REPL (1<<1)
 #define CMD_CALL_REPROCESSING (1<<2)
+#define CMD_CALL_FROM_MODULE (1<<3)  /* From RM_Call */
 #define CMD_CALL_PROPAGATE (CMD_CALL_PROPAGATE_AOF|CMD_CALL_PROPAGATE_REPL)
 #define CMD_CALL_FULL (CMD_CALL_PROPAGATE)
-#define CMD_CALL_FROM_MODULE (1<<2)  /* From RM_Call */
 
 /* Command propagation flags, see propagateNow() function */
 #define PROPAGATE_NONE 0
@@ -706,6 +711,7 @@ typedef enum {
  * encoding version. */
 #define OBJ_MODULE 5    /* Module object. */
 #define OBJ_STREAM 6    /* Stream object. */
+#define OBJ_TYPE_MAX 7  /* Maximum number of object types */
 
 /* Extract encver / signature from a module type ID. */
 #define REDISMODULE_TYPE_ENCVER_BITS 10
@@ -816,6 +822,7 @@ struct RedisModule {
     struct moduleLoadQueueEntry *loadmod; /* Module load arguments for config rewrite. */
     int num_commands_with_acl_categories; /* Number of commands in this module included in acl categories */
     int onload;     /* Flag to identify if the call is being made from Onload (0 or 1) */
+    size_t num_acl_categories_added; /* Number of acl categories added by this module. */
 };
 typedef struct RedisModule RedisModule;
 
@@ -1211,7 +1218,7 @@ typedef struct client {
     long long woff;         /* Last write global replication offset. */
     list *watched_keys;     /* Keys WATCHED for MULTI/EXEC CAS */
     dict *pubsub_channels;  /* channels a client is interested in (SUBSCRIBE) */
-    list *pubsub_patterns;  /* patterns a client is interested in (SUBSCRIBE) */
+    dict *pubsub_patterns;  /* patterns a client is interested in (PSUBSCRIBE) */
     dict *pubsubshard_channels;  /* shard level channels a client is interested in (SSUBSCRIBE) */
     sds peerid;             /* Cached peer ID. */
     sds sockname;           /* Cached connection target address. */
@@ -1371,9 +1378,8 @@ typedef struct redisOp {
 /* Defines an array of Redis operations. There is an API to add to this
  * structure in an easy way.
  *
- * redisOpArrayInit();
- * redisOpArrayAppend();
- * redisOpArrayFree();
+ * int redisOpArrayAppend(redisOpArray *oa, int dbid, robj **argv, int argc, int target);
+ * void redisOpArrayFree(redisOpArray *oa);
  */
 typedef struct redisOpArray {
     redisOp *ops;
@@ -1546,7 +1552,7 @@ struct redisServer {
     dict *orig_commands;        /* Command table before command renaming. */
     aeEventLoop *el;
     rax *errors;                /* Errors table */
-    redisAtomic unsigned int lruclock; /* Clock for LRU eviction */
+    unsigned int lruclock; /* Clock for LRU eviction */
     volatile sig_atomic_t shutdown_asap; /* Shutdown ordered by signal handler. */
     mstime_t shutdown_mstime;   /* Timestamp to limit graceful shutdown. */
     int last_sig_received;      /* Indicates the last SIGNAL received, if any (e.g., SIGINT or SIGTERM). */
@@ -1691,16 +1697,27 @@ struct redisServer {
     long long stat_io_writes_processed; /* Number of write events processed by IO / Main threads */
     redisAtomic long long stat_total_reads_processed; /* Total number of read events processed */
     redisAtomic long long stat_total_writes_processed; /* Total number of write events processed */
+    long long stat_client_qbuf_limit_disconnections;  /* Total number of clients reached query buf length limit */
+    long long stat_client_outbuf_limit_disconnections;  /* Total number of clients reached output buf length limit */
     /* The following two are used to track instantaneous metrics, like
      * number of operations per second, network traffic. */
     struct {
-        long long last_sample_time; /* Timestamp of last sample in ms */
-        long long last_sample_count;/* Count in last sample */
+        long long last_sample_base;  /* The divisor of last sample window */
+        long long last_sample_value; /* The dividend of last sample window */
         long long samples[STATS_METRIC_SAMPLES];
         int idx;
     } inst_metric[STATS_METRIC_COUNT];
     long long stat_reply_buffer_shrinks; /* Total number of output buffer shrinks */
     long long stat_reply_buffer_expands; /* Total number of output buffer expands */
+    monotime el_start;
+    /* The following two are used to record the max number of commands executed in one eventloop.
+     * Note that commands in transactions are also counted. */
+    long long el_cmd_cnt_start;
+    long long el_cmd_cnt_max;
+    /* The sum of active-expire, active-defrag and all other tasks done by cron and beforeSleep,
+       but excluding read, write and AOF, which are counted by other sets of metrics. */
+    monotime el_cron_duration; 
+    durationStats duration_stats[EL_DURATION_TYPE_NUM];
 
     /* Configuration */
     int verbosity;                  /* Loglevel in redis.conf */
@@ -1916,6 +1933,7 @@ struct redisServer {
     unsigned int tracking_clients;  /* # of clients with tracking enabled.*/
     size_t tracking_table_max_keys; /* Max number of keys in tracking table. */
     list *tracking_pending_keys; /* tracking invalidation keys pending to flush */
+    list *pending_push_messages; /* pending publish or other push messages to flush */
     /* Sort parameters - qsort_r() is only available under BSD so we
      * have to take this state global, in order to pass it to sortCompare() */
     int sort_desc;
@@ -1967,6 +1985,7 @@ struct redisServer {
                                        if the master is in failure state. */
     char *cluster_announce_ip;  /* IP address to announce on cluster bus. */
     char *cluster_announce_hostname;  /* hostname to announce on cluster bus. */
+    char *cluster_announce_human_nodename;  /* Human readable node name assigned to a node. */
     int cluster_preferred_endpoint_type; /* Use the announced hostname when available. */
     int cluster_announce_port;     /* base port to announce on cluster bus. */
     int cluster_announce_tls_port; /* TLS port to announce on cluster bus. */
@@ -2457,6 +2476,8 @@ void moduleLoadFromQueue(void);
 int moduleGetCommandKeysViaAPI(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result);
 int moduleGetCommandChannelsViaAPI(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result);
 moduleType *moduleTypeLookupModuleByID(uint64_t id);
+moduleType *moduleTypeLookupModuleByName(const char *name);
+moduleType *moduleTypeLookupModuleByNameIgnoreCase(const char *name);
 void moduleTypeNameByID(char *name, uint64_t moduleid);
 const char *moduleTypeModuleName(moduleType *mt);
 const char *moduleNameFromCommand(struct redisCommand *cmd);
@@ -2471,14 +2492,14 @@ void moduleAcquireGIL(void);
 int moduleTryAcquireGIL(void);
 void moduleReleaseGIL(void);
 void moduleNotifyKeyspaceEvent(int type, const char *event, robj *key, int dbid);
-void firePostExecutionUnitJobs();
+void firePostExecutionUnitJobs(void);
 void moduleCallCommandFilters(client *c);
-void modulePostExecutionUnitOperations();
+void modulePostExecutionUnitOperations(void);
 void ModuleForkDoneHandler(int exitcode, int bysignal);
 int TerminateModuleForkChild(int child_pid, int wait);
 ssize_t rdbSaveModulesAux(rio *rdb, int when);
-int moduleAllDatatypesHandleErrors();
-int moduleAllModulesHandleReplAsyncLoad();
+int moduleAllDatatypesHandleErrors(void);
+int moduleAllModulesHandleReplAsyncLoad(void);
 sds modulesCollectInfo(sds info, dict *sections_dict, int for_crash_report, int sections);
 void moduleFireServerEvent(uint64_t eid, int subid, void *data);
 void processModuleLoadingProgressEvent(int is_aof);
@@ -2606,11 +2627,11 @@ void unpauseActions(pause_purpose purpose);
 uint32_t isPausedActions(uint32_t action_bitmask);
 uint32_t isPausedActionsWithUpdate(uint32_t action_bitmask);
 void updatePausedActions(void);
-void unblockPostponedClients();
+void unblockPostponedClients(void);
 void processEventsWhileBlocked(void);
-void whileBlockedCron();
-void blockingOperationStarts();
-void blockingOperationEnds();
+void whileBlockedCron(void);
+void blockingOperationStarts(void);
+void blockingOperationEnds(void);
 int handleClientsWithPendingWrites(void);
 int handleClientsWithPendingWritesUsingThreads(void);
 int handleClientsWithPendingReadsUsingThreads(void);
@@ -2716,6 +2737,7 @@ void freeZsetObject(robj *o);
 void freeHashObject(robj *o);
 void dismissObject(robj *o, size_t dump_size);
 robj *createObject(int type, void *ptr);
+void initObjectLRUOrLFU(robj *o);
 robj *createStringObject(const char *ptr, size_t len);
 robj *createRawStringObject(const char *ptr, size_t len);
 robj *createEmbeddedStringObject(const char *ptr, size_t len);
@@ -2725,10 +2747,12 @@ robj *dupStringObject(const robj *o);
 int isSdsRepresentableAsLongLong(sds s, long long *llval);
 int isObjectRepresentableAsLongLong(robj *o, long long *llongval);
 robj *tryObjectEncoding(robj *o);
+robj *tryObjectEncodingEx(robj *o, int try_trim);
 robj *getDecodedObject(robj *o);
 size_t stringObjectLen(robj *o);
 robj *createStringObjectFromLongLong(long long value);
 robj *createStringObjectFromLongLongForValue(long long value);
+robj *createStringObjectFromLongLongWithSds(long long value);
 robj *createStringObjectFromLongDouble(long double value, int humanfriendly);
 robj *createQuicklistObject(void);
 robj *createListListpackObject(void);
@@ -2776,7 +2800,7 @@ void replicationCron(void);
 void replicationStartPendingFork(void);
 void replicationHandleMasterDisconnection(void);
 void replicationCacheMaster(client *c);
-void resizeReplicationBacklog();
+void resizeReplicationBacklog(void);
 void replicationSetMaster(char *ip, int port);
 void replicationUnsetMaster(void);
 void refreshGoodSlavesCount(void);
@@ -2805,7 +2829,7 @@ void rdbPipeWriteHandlerConnRemoved(struct connection *conn);
 void clearFailoverState(void);
 void updateFailoverStatus(void);
 void abortFailover(const char *err);
-const char *getFailoverStateString();
+const char *getFailoverStateString(void);
 
 /* Generic persistence functions */
 void startLoadingFile(size_t size, char* filename, int rdbflags);
@@ -2839,7 +2863,7 @@ void stopAppendOnly(void);
 int startAppendOnly(void);
 void backgroundRewriteDoneHandler(int exitcode, int bysignal);
 void killAppendOnlyChild(void);
-void restartAOFAfterSYNC();
+void restartAOFAfterSYNC(void);
 void aofLoadManifestFromDisk(void);
 void aofOpenIfNeededOnServerStart(void);
 void aofManifestFree(aofManifest *am);
@@ -2856,8 +2880,8 @@ void receiveChildInfo(void);
 
 /* Fork helpers */
 int redisFork(int purpose);
-int hasActiveChildProcess();
-void resetChildState();
+int hasActiveChildProcess(void);
+void resetChildState(void);
 int isMutuallyExclusiveChildType(int type);
 
 /* acl.c -- Authentication related prototypes. */
@@ -2905,19 +2929,21 @@ int ACLCheckAllPerm(client *c, int *idxptr);
 int ACLSetUser(user *u, const char *op, ssize_t oplen);
 sds ACLStringSetUser(user *u, sds username, sds *argv, int argc);
 uint64_t ACLGetCommandCategoryFlagByName(const char *name);
+int ACLAddCommandCategory(const char *name, uint64_t flag);
+void ACLCleanupCategoriesOnFailure(size_t num_acl_categories_added);
 int ACLAppendUserForLoading(sds *argv, int argc, int *argc_err);
 const char *ACLSetUserStringError(void);
 int ACLLoadConfiguredUsers(void);
 robj *ACLDescribeUser(user *u);
 void ACLLoadUsersAtStartup(void);
 void addReplyCommandCategories(client *c, struct redisCommand *cmd);
-user *ACLCreateUnlinkedUser();
+user *ACLCreateUnlinkedUser(void);
 void ACLFreeUserAndKillClients(user *u);
 void addACLLogEntry(client *c, int reason, int context, int argpos, sds username, sds object);
 sds getAclErrorMessage(int acl_res, user *user, struct redisCommand *cmd, sds errored_val, int verbose);
 void ACLUpdateDefaultUserPassword(sds password);
 sds genRedisInfoStringACLStats(sds info);
-void ACLRecomputeCommandBitsFromCommandRulesAllUsers();
+void ACLRecomputeCommandBitsFromCommandRulesAllUsers(void);
 
 /* Sorted sets data type */
 
@@ -2956,8 +2982,7 @@ void zslFree(zskiplist *zsl);
 zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele);
 unsigned char *zzlInsert(unsigned char *zl, sds ele, double score);
 int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node);
-zskiplistNode *zslFirstInRange(zskiplist *zsl, zrangespec *range);
-zskiplistNode *zslLastInRange(zskiplist *zsl, zrangespec *range);
+zskiplistNode *zslNthInRange(zskiplist *zsl, zrangespec *range, long n);
 double zzlGetScore(unsigned char *sptr);
 void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
 void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr);
@@ -2980,8 +3005,7 @@ void zslFreeLexRange(zlexrangespec *spec);
 int zslParseLexRange(robj *min, robj *max, zlexrangespec *spec);
 unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range);
 unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range);
-zskiplistNode *zslFirstInLexRange(zskiplist *zsl, zlexrangespec *range);
-zskiplistNode *zslLastInLexRange(zskiplist *zsl, zlexrangespec *range);
+zskiplistNode *zslNthInLexRange(zskiplist *zsl, zlexrangespec *range, long n);
 int zzlLexValueGteMin(unsigned char *p, zlexrangespec *spec);
 int zzlLexValueLteMax(unsigned char *p, zlexrangespec *spec);
 int zslLexValueGteMin(sds value, zlexrangespec *spec);
@@ -2989,14 +3013,13 @@ int zslLexValueLteMax(sds value, zlexrangespec *spec);
 
 /* Core functions */
 int getMaxmemoryState(size_t *total, size_t *logical, size_t *tofree, float *level);
-size_t freeMemoryGetNotCountedMemory();
+size_t freeMemoryGetNotCountedMemory(void);
 int overMaxmemoryAfterAlloc(size_t moremem);
 uint64_t getCommandFlags(client *c);
 int processCommand(client *c);
 int processPendingCommandAndInputBuffer(client *c);
 int processCommandAndResetClient(client *c);
 void setupSignalHandlers(void);
-void removeSignalHandlers(void);
 int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler);
 connListener *listenerByType(const char *typename);
 int changeListener(connListener *listener);
@@ -3010,11 +3033,11 @@ struct redisCommand *lookupCommandByCString(const char *s);
 struct redisCommand *lookupCommandOrOriginal(robj **argv, int argc);
 int commandCheckExistence(client *c, sds *err);
 int commandCheckArity(client *c, sds *err);
-void startCommandExecution();
+void startCommandExecution(void);
 int incrCommandStatsOnError(struct redisCommand *cmd, int flags);
 void call(client *c, int flags);
 void alsoPropagate(int dbid, robj **argv, int argc, int target);
-void postExecutionUnitOperations();
+void postExecutionUnitOperations(void);
 void redisOpArrayFree(redisOpArray *oa);
 void forceCommandPropagation(client *c, int flags);
 void preventCommandPropagation(client *c);
@@ -3046,7 +3069,7 @@ void incrementErrorCount(const char *fullerr, size_t namelen);
 void closeListeningSockets(int unlink_unix_socket);
 void updateCachedTime(int update_daylight_info);
 void enterExecutionUnit(int update_cached_time, long long us);
-void exitExecutionUnit();
+void exitExecutionUnit(void);
 void resetServerStats(void);
 void activeDefragCycle(void);
 unsigned int getLRUClock(void);
@@ -3069,7 +3092,7 @@ void dismissMemoryInChild(void);
 int restartServer(int flags, mstime_t delay);
 
 /* Set data type */
-robj *setTypeCreate(sds value);
+robj *setTypeCreate(sds value, size_t size_hint);
 int setTypeAdd(robj *subject, sds value);
 int setTypeAddAux(robj *set, char *str, size_t len, int64_t llval, int str_is_sds);
 int setTypeRemove(robj *subject, sds value);
@@ -3081,7 +3104,6 @@ void setTypeReleaseIterator(setTypeIterator *si);
 int setTypeNext(setTypeIterator *si, char **str, size_t *len, int64_t *llele);
 sds setTypeNextObject(setTypeIterator *si);
 int setTypeRandomElement(robj *setobj, char **str, size_t *len, int64_t *llele);
-unsigned long setTypeRandomElements(robj *set, unsigned long count, robj *aux_set);
 unsigned long setTypeSize(const robj *subject);
 void setTypeConvert(robj *subject, int enc);
 int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic);
@@ -3120,8 +3142,8 @@ int pubsubUnsubscribeAllPatterns(client *c, int notify);
 int pubsubPublishMessage(robj *channel, robj *message, int sharded);
 int pubsubPublishMessageAndPropagateToCluster(robj *channel, robj *message, int sharded);
 void addReplyPubsubMessage(client *c, robj *channel, robj *msg, robj *message_bulk);
-int serverPubsubSubscriptionCount();
-int serverPubsubShardSubscriptionCount();
+int serverPubsubSubscriptionCount(void);
+int serverPubsubShardSubscriptionCount(void);
 size_t pubsubMemOverhead(client *c);
 
 /* Keyspace events notification */
@@ -3175,12 +3197,12 @@ struct rewriteConfigState; /* Forward declaration to export API. */
 int rewriteConfigRewriteLine(struct rewriteConfigState *state, const char *option, sds line, int force);
 void rewriteConfigMarkAsProcessed(struct rewriteConfigState *state, const char *option);
 int rewriteConfig(char *path, int force_write);
-void initConfigValues();
+void initConfigValues(void);
 void removeConfig(sds name);
-sds getConfigDebugInfo();
+sds getConfigDebugInfo(void);
 int allowProtectedAction(int config, client *c);
-void initServerClientMemUsageBuckets();
-void freeServerClientMemUsageBuckets();
+void initServerClientMemUsageBuckets(void);
+void freeServerClientMemUsageBuckets(void);
 
 /* Module Configuration */
 typedef struct ModuleConfig ModuleConfig;
@@ -3235,6 +3257,7 @@ void dbReplaceValue(redisDb *db, robj *key, robj *val);
 #define SETKEY_NO_SIGNAL 2
 #define SETKEY_ALREADY_EXIST 4
 #define SETKEY_DOESNT_EXIST 8
+#define SETKEY_ADD_OR_UPDATE 16 /* Key most likely doesn't exists */
 void setKey(client *c, redisDb *db, robj *key, robj *val, int flags);
 robj *dbRandomKey(redisDb *db);
 int dbGenericDelete(redisDb *db, robj *key, int async, int flags);
@@ -3248,7 +3271,7 @@ robj *dbUnshareStringValue(redisDb *db, robj *key, robj *o);
 long long emptyData(int dbnum, int flags, void(callback)(dict*));
 long long emptyDbStructure(redisDb *dbarray, int dbnum, int async, void(callback)(dict*));
 void flushAllDataAndResetRDB(int flags);
-long long dbTotalServerKeyCount();
+long long dbTotalServerKeyCount(void);
 redisDb *initTempDb(void);
 void discardTempDb(redisDb *tempDb, void(callback)(dict*));
 
@@ -3325,16 +3348,16 @@ sds luaCreateFunction(client *c, robj *body);
 void luaLdbLineHook(lua_State *lua, lua_Debug *ar);
 void freeLuaScriptsAsync(dict *lua_scripts);
 void freeFunctionsAsync(functionsLibCtx *lib_ctx);
-int ldbIsEnabled();
+int ldbIsEnabled(void);
 void ldbLog(sds entry);
 void ldbLogRedisReply(char *reply);
 void sha1hex(char *digest, char *script, size_t len);
-unsigned long evalMemory();
-dict* evalScriptsDict();
-unsigned long evalScriptsMemory();
+unsigned long evalMemory(void);
+dict* evalScriptsDict(void);
+unsigned long evalScriptsMemory(void);
 uint64_t evalGetCommandFlags(client *c, uint64_t orig_flags);
 uint64_t fcallGetCommandFlags(client *c, uint64_t orig_flags);
-int isInsideYieldingLongCommand();
+int isInsideYieldingLongCommand(void);
 
 typedef struct luaScript {
     uint64_t flags;
@@ -3366,7 +3389,7 @@ void signalDeletedKeyAsReady(redisDb *db, robj *key, int type);
 void updateStatsOnUnblock(client *c, long blocked_us, long reply_us, int had_errors);
 void scanDatabaseForDeletedKeys(redisDb *emptied, redisDb *replaced_with);
 void totalNumberOfBlockingKeys(unsigned long *blocking_keys, unsigned long *bloking_keys_on_nokey);
-
+void blockedBeforeSleep(void);
 
 /* timeout.c -- Blocked clients timeout and connections timeout. */
 void addClientToTimeoutTable(client *c);
@@ -3684,13 +3707,14 @@ void _serverPanic(const char *file, int line, const char *msg, ...)
 void _serverPanic(const char *file, int line, const char *msg, ...);
 #endif
 void serverLogObjectDebugInfo(const robj *o);
-void sigsegvHandler(int sig, siginfo_t *info, void *secret);
+void setupSigSegvHandler(void);
+void removeSigSegvHandlers(void);
 const char *getSafeInfoString(const char *s, size_t len, char **tmp);
 dict *genInfoSectionDict(robj **argv, int argc, char **defaults, int *out_all, int *out_everything);
 void releaseInfoSectionDict(dict *sec);
 sds genRedisInfoString(dict *section_dict, int all_sections, int everything);
 sds genModulesInfoString(sds info);
-void applyWatchdogPeriod();
+void applyWatchdogPeriod(void);
 void watchdogScheduleSignal(int period);
 void serverLogHexDump(int level, char *descr, void *value, size_t len);
 int memtest_preserving_test(unsigned long *m, size_t bytes, int passes);

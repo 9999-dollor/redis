@@ -88,6 +88,11 @@ void rdbReportError(int corruption_error, int linenum, char *reason, ...) {
         /* If we're loading an rdb file form disk, run rdb check (and exit) */
         serverLog(LL_WARNING, "%s", msg);
         char *argv[2] = {"",rdbFileBeingLoaded};
+        if (anetIsFifo(argv[1])) {
+            /* Cannot check RDB FIFO because we cannot reopen the FIFO and check already streamed data. */
+            rdbCheckError("Cannot check RDB that is a FIFO: %s", argv[1]);
+            return;
+        }
         redis_check_rdb_main(2,argv,NULL);
     } else if (corruption_error) {
         /* In diskless loading, in case of corrupt file, log and exit. */
@@ -132,7 +137,7 @@ time_t rdbLoadTime(rio *rdb) {
     return (time_t)t32;
 }
 
-int rdbSaveMillisecondTime(rio *rdb, long long t) {
+ssize_t rdbSaveMillisecondTime(rio *rdb, long long t) {
     int64_t t64 = (int64_t) t;
     memrev64ifbe(&t64); /* Store in little endian. */
     return rdbWriteRaw(rdb,&t64,8);
@@ -321,7 +326,7 @@ void *rdbLoadIntegerObject(rio *rdb, int enctype, int flags, size_t *lenptr) {
     } else if (encode) {
         return createStringObjectFromLongLongForValue(val);
     } else {
-        return createObject(OBJ_STRING,sdsfromlonglong(val));
+        return createStringObjectFromLongLongWithSds(val);
     }
 }
 
@@ -578,7 +583,7 @@ robj *rdbLoadEncodedStringObject(rio *rdb) {
  * 254: + inf
  * 255: - inf
  */
-int rdbSaveDoubleValue(rio *rdb, double val) {
+ssize_t rdbSaveDoubleValue(rio *rdb, double val) {
     unsigned char buf[128];
     int len;
 
@@ -1839,7 +1844,7 @@ robj *rdbLoadObject(int rdbtype, rio *rdb, sds key, int dbid, int *error) {
     if (rdbtype == RDB_TYPE_STRING) {
         /* Read string value */
         if ((o = rdbLoadEncodedStringObject(rdb)) == NULL) return NULL;
-        o = tryObjectEncoding(o);
+        o = tryObjectEncodingEx(o, 0);
     } else if (rdbtype == RDB_TYPE_LIST) {
         /* Read list value */
         if ((len = rdbLoadLen(rdb,NULL)) == RDB_LENERR) return NULL;
@@ -2976,7 +2981,7 @@ int rdbFunctionLoad(rio *rdb, int ver, functionsLibCtx* lib_ctx, int rdbflags, s
 
     if (lib_ctx) {
         sds library_name = NULL;
-        if (!(library_name = functionsCreateWithLibraryCtx(final_payload, rdbflags & RDBFLAGS_ALLOW_DUP, &error, lib_ctx))) {
+        if (!(library_name = functionsCreateWithLibraryCtx(final_payload, rdbflags & RDBFLAGS_ALLOW_DUP, &error, lib_ctx, 0))) {
             if (!error) {
                 error = sdsnew("Failed creating the library");
             }

@@ -74,12 +74,16 @@
 
 #if !defined(NO_MALLOC_USABLE_SIZE) && \
     (defined(__GLIBC__) || defined(__FreeBSD__) || \
+     defined(__DragonFly__) || defined(__HAIKU__) || \
      defined(USE_MALLOC_USABLE_SIZE))
 
 /* Includes for malloc_usable_size() */
 #ifdef __FreeBSD__
 #include <malloc_np.h>
 #else
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <malloc.h>
 #endif
 
@@ -96,13 +100,16 @@
 #define HAVE_DEFRAG
 #endif
 
-__attribute__((malloc,alloc_size(1))) void *zmalloc(size_t size);
-__attribute__((malloc,alloc_size(1))) void *zcalloc(size_t size);
-__attribute__((malloc,alloc_size(1,2))) void *zcalloc_num(size_t num, size_t size);
-__attribute__((alloc_size(2))) void *zrealloc(void *ptr, size_t size);
-__attribute__((malloc,alloc_size(1))) void *ztrymalloc(size_t size);
-__attribute__((malloc,alloc_size(1))) void *ztrycalloc(size_t size);
-__attribute__((alloc_size(2))) void *ztryrealloc(void *ptr, size_t size);
+/* 'noinline' attribute is intended to prevent the `-Wstringop-overread` warning
+ * when using gcc-12 later with LTO enabled. It may be removed once the
+ * bug[https://gcc.gnu.org/bugzilla/show_bug.cgi?id=96503] is fixed. */
+__attribute__((malloc,alloc_size(1),noinline)) void *zmalloc(size_t size);
+__attribute__((malloc,alloc_size(1),noinline)) void *zcalloc(size_t size);
+__attribute__((malloc,alloc_size(1,2),noinline)) void *zcalloc_num(size_t num, size_t size);
+__attribute__((alloc_size(2),noinline)) void *zrealloc(void *ptr, size_t size);
+__attribute__((malloc,alloc_size(1),noinline)) void *ztrymalloc(size_t size);
+__attribute__((malloc,alloc_size(1),noinline)) void *ztrycalloc(size_t size);
+__attribute__((alloc_size(2),noinline)) void *ztryrealloc(void *ptr, size_t size);
 void zfree(void *ptr);
 void *zmalloc_usable(size_t size, size_t *usable);
 void *zcalloc_usable(size_t size, size_t *usable);
@@ -117,7 +124,7 @@ void zmalloc_set_oom_handler(void (*oom_handler)(size_t));
 size_t zmalloc_get_rss(void);
 int zmalloc_get_allocator_info(size_t *allocated, size_t *active, size_t *resident);
 void set_jemalloc_bg_thread(int enable);
-int jemalloc_purge();
+int jemalloc_purge(void);
 size_t zmalloc_get_private_dirty(long pid);
 size_t zmalloc_get_smap_bytes_by_field(char *field, long pid);
 size_t zmalloc_get_memory_size(void);

@@ -66,7 +66,10 @@ typedef ucontext_t sigcontext_t;
 /* Globals */
 static int bug_report_start = 0; /* True if bug report header was already logged. */
 static pthread_mutex_t bug_report_start_mutex = PTHREAD_MUTEX_INITIALIZER;
-
+/* Mutex for a case when two threads crash at the same time. */
+static pthread_mutex_t signal_handler_lock;
+static pthread_mutexattr_t signal_handler_lock_attr;
+static volatile int signal_handler_lock_initialized = 0;
 /* Forward declarations */
 void bugReportStart(void);
 void printCrashReport(void);
@@ -329,7 +332,8 @@ void mallctl_int(client *c, robj **argv, int argc) {
     }
     size_t sz = sizeof(old);
     while (sz > 0) {
-        if ((ret=je_mallctl(argv[0]->ptr, &old, &sz, argc > 1? &val: NULL, argc > 1?sz: 0))) {
+        size_t zz = sz;
+        if ((ret=je_mallctl(argv[0]->ptr, &old, &zz, argc > 1? &val: NULL, argc > 1?sz: 0))) {
             if (ret == EPERM && argc > 1) {
                 /* if this option is write only, try just writing to it. */
                 if (!(ret=je_mallctl(argv[0]->ptr, NULL, 0, &val, sz))) {
@@ -412,9 +416,9 @@ void debugCommand(client *c) {
 "    Create a memory leak of the input string.",
 "LOG <message>",
 "    Write <message> to the server log.",
-"HTSTATS <dbid>",
+"HTSTATS <dbid> [full]",
 "    Return hash table statistics of the specified Redis database.",
-"HTSTATS-KEY <key>",
+"HTSTATS-KEY <key> [full]",
 "    Like HTSTATS but for the hash table stored at <key>'s value.",
 "LOADAOF",
 "    Flush the AOF buffers on disk and reload the AOF in memory.",
@@ -712,7 +716,10 @@ NULL
         if (getPositiveLongFromObjectOrReply(c, c->argv[2], &keys, NULL) != C_OK)
             return;
 
-        dictExpand(c->db->dict,keys);
+        if (dictTryExpand(c->db->dict, keys) != DICT_OK) {
+            addReplyError(c, "OOM in dictTryExpand");
+            return;
+        }
         long valsize = 0;
         if ( c->argc == 5 && getPositiveLongFromObjectOrReply(c, c->argv[4], &valsize, NULL) != C_OK ) 
             return;
@@ -882,10 +889,11 @@ NULL
         sizes = sdscatprintf(sizes,"sdshdr32:%d ",(int)sizeof(struct sdshdr32));
         sizes = sdscatprintf(sizes,"sdshdr64:%d ",(int)sizeof(struct sdshdr64));
         addReplyBulkSds(c,sizes);
-    } else if (!strcasecmp(c->argv[1]->ptr,"htstats") && c->argc == 3) {
+    } else if (!strcasecmp(c->argv[1]->ptr,"htstats") && c->argc >= 3) {
         long dbid;
         sds stats = sdsempty();
         char buf[4096];
+        int full = 0;
 
         if (getLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) {
             sdsfree(stats);
@@ -896,20 +904,26 @@ NULL
             addReplyError(c,"Out of range database");
             return;
         }
+        if (c->argc >= 4 && !strcasecmp(c->argv[3]->ptr,"full"))
+            full = 1;
 
         stats = sdscatprintf(stats,"[Dictionary HT]\n");
-        dictGetStats(buf,sizeof(buf),server.db[dbid].dict);
+        dictGetStats(buf,sizeof(buf),server.db[dbid].dict,full);
         stats = sdscat(stats,buf);
 
         stats = sdscatprintf(stats,"[Expires HT]\n");
-        dictGetStats(buf,sizeof(buf),server.db[dbid].expires);
+        dictGetStats(buf,sizeof(buf),server.db[dbid].expires,full);
         stats = sdscat(stats,buf);
 
         addReplyVerbatim(c,stats,sdslen(stats),"txt");
         sdsfree(stats);
-    } else if (!strcasecmp(c->argv[1]->ptr,"htstats-key") && c->argc == 3) {
+    } else if (!strcasecmp(c->argv[1]->ptr,"htstats-key") && c->argc >= 3) {
         robj *o;
         dict *ht = NULL;
+        int full = 0;
+
+        if (c->argc >= 4 && !strcasecmp(c->argv[3]->ptr,"full"))
+            full = 1;
 
         if ((o = objectCommandLookupOrReply(c,c->argv[2],shared.nokeyerr))
                 == NULL) return;
@@ -932,7 +946,7 @@ NULL
                             "represented using an hash table");
         } else {
             char buf[4096];
-            dictGetStats(buf,sizeof(buf),ht);
+            dictGetStats(buf,sizeof(buf),ht,full);
             addReplyVerbatim(c,buf,strlen(buf),"txt");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"change-repl-id") && c->argc == 2) {
@@ -1052,7 +1066,7 @@ void _serverAssert(const char *estr, const char *file, int line) {
     }
 
     // remove the signal handler so on abort() we will output the crash report.
-    removeSignalHandlers();
+    removeSigSegvHandlers();
     bugReportEnd(0, 0);
 }
 
@@ -1148,7 +1162,7 @@ void _serverPanic(const char *file, int line, const char *msg, ...) {
     }
 
     // remove the signal handler so on abort() we will output the crash report.
-    removeSignalHandlers();
+    removeSigSegvHandlers();
     bugReportEnd(0, 0);
 }
 
@@ -1210,6 +1224,8 @@ static void* getAndSetMcontextEip(ucontext_t *uc, void *eip) {
     GET_SET_RETURN(uc->uc_mcontext.gregs[16], eip);
     #elif defined(__ia64__) /* Linux IA64 */
     GET_SET_RETURN(uc->uc_mcontext.sc_ip, eip);
+    #elif defined(__riscv) /* Linux RISC-V */
+    GET_SET_RETURN(uc->uc_mcontext.__gregs[REG_PC], eip);
     #elif defined(__arm__) /* Linux ARM */
     GET_SET_RETURN(uc->uc_mcontext.arm_pc, eip);
     #elif defined(__aarch64__) /* Linux AArch64 */
@@ -1444,6 +1460,49 @@ void logRegisters(ucontext_t *uc) {
         (unsigned long) uc->uc_mcontext.gregs[18]
     );
     logStackContent((void**)uc->uc_mcontext.gregs[15]);
+    #elif defined(__riscv) /* Linux RISC-V */
+    serverLog(LL_WARNING,
+	"\n"
+    "ra:%016lx gp:%016lx\ntp:%016lx t0:%016lx\n"
+    "t1:%016lx t2:%016lx\ns0:%016lx s1:%016lx\n"
+    "a0:%016lx a1:%016lx\na2:%016lx a3:%016lx\n"
+    "a4:%016lx a5:%016lx\na6:%016lx a7:%016lx\n"
+    "s2:%016lx s3:%016lx\ns4:%016lx s5:%016lx\n"
+    "s6:%016lx s7:%016lx\ns8:%016lx s9:%016lx\n"
+    "s10:%016lx s11:%016lx\nt3:%016lx t4:%016lx\n"
+    "t5:%016lx t6:%016lx\n",
+        (unsigned long) uc->uc_mcontext.__gregs[1],
+        (unsigned long) uc->uc_mcontext.__gregs[3],
+        (unsigned long) uc->uc_mcontext.__gregs[4],
+        (unsigned long) uc->uc_mcontext.__gregs[5],
+        (unsigned long) uc->uc_mcontext.__gregs[6],
+        (unsigned long) uc->uc_mcontext.__gregs[7],
+        (unsigned long) uc->uc_mcontext.__gregs[8],
+        (unsigned long) uc->uc_mcontext.__gregs[9],
+        (unsigned long) uc->uc_mcontext.__gregs[10],
+        (unsigned long) uc->uc_mcontext.__gregs[11],
+        (unsigned long) uc->uc_mcontext.__gregs[12],
+        (unsigned long) uc->uc_mcontext.__gregs[13],
+        (unsigned long) uc->uc_mcontext.__gregs[14],
+        (unsigned long) uc->uc_mcontext.__gregs[15],
+        (unsigned long) uc->uc_mcontext.__gregs[16],
+        (unsigned long) uc->uc_mcontext.__gregs[17],
+        (unsigned long) uc->uc_mcontext.__gregs[18],
+        (unsigned long) uc->uc_mcontext.__gregs[19],
+        (unsigned long) uc->uc_mcontext.__gregs[20],
+        (unsigned long) uc->uc_mcontext.__gregs[21],
+        (unsigned long) uc->uc_mcontext.__gregs[22],
+        (unsigned long) uc->uc_mcontext.__gregs[23],
+        (unsigned long) uc->uc_mcontext.__gregs[24],
+        (unsigned long) uc->uc_mcontext.__gregs[25],
+        (unsigned long) uc->uc_mcontext.__gregs[26],
+        (unsigned long) uc->uc_mcontext.__gregs[27],
+        (unsigned long) uc->uc_mcontext.__gregs[28],
+        (unsigned long) uc->uc_mcontext.__gregs[29],
+        (unsigned long) uc->uc_mcontext.__gregs[30],
+        (unsigned long) uc->uc_mcontext.__gregs[31]
+    );
+    logStackContent((void**)uc->uc_mcontext.__gregs[REG_SP]);
     #elif defined(__aarch64__) /* Linux AArch64 */
     serverLog(LL_WARNING,
 	      "\n"
@@ -1802,7 +1861,7 @@ sds genClusterDebugString(sds infostring) {
     infostring = sdscatprintf(infostring, "\r\n# Cluster info\r\n");
     infostring = sdscatsds(infostring, genClusterInfoString()); 
     infostring = sdscatprintf(infostring, "\n------ CLUSTER NODES OUTPUT ------\n");
-    infostring = sdscatsds(infostring, clusterGenNodesDescription(0, 0));
+    infostring = sdscatsds(infostring, clusterGenNodesDescription(NULL, 0, 0));
     
     return infostring;
 }
@@ -2056,13 +2115,23 @@ void dumpCodeAroundEIP(void *eip) {
     }
 }
 
-void invalidFunctionWasCalled() {}
+void invalidFunctionWasCalled(void) {}
 
-typedef void (*invalidFunctionWasCalledType)();
+typedef void (*invalidFunctionWasCalledType)(void);
 
-void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
+static void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     UNUSED(secret);
     UNUSED(info);
+    /* Check if it is safe to enter the signal handler. second thread crashing at the same time will deadlock. */
+    if(pthread_mutex_lock(&signal_handler_lock) == EDEADLK) {
+        /* If this thread already owns the lock (meaning we crashed during handling a signal)
+         * log that the crash report can't be generated. */
+        serverLog(LL_WARNING,
+            "Crashed running signal handler. Can't continue to generate the crash report");
+        /* gracefully exit */
+        bugReportEnd(1, sig);
+        return;
+    }
 
     bugReportStart();
     serverLog(LL_WARNING,
@@ -2115,6 +2184,47 @@ void sigsegvHandler(int sig, siginfo_t *info, void *secret) {
     bugReportEnd(1, sig);
 }
 
+void setupSigSegvHandler(void) {
+    /* Initialize the signal handler lock. 
+    Attempting to initialize an already initialized mutex or mutexattr results in undefined behavior. */
+    if (!signal_handler_lock_initialized) {
+        /* Set signal handler with error checking attribute. re-lock within the same thread will error. */
+        pthread_mutexattr_init(&signal_handler_lock_attr);
+        pthread_mutexattr_settype(&signal_handler_lock_attr, PTHREAD_MUTEX_ERRORCHECK);
+        pthread_mutex_init(&signal_handler_lock, &signal_handler_lock_attr);
+        signal_handler_lock_initialized = 1;
+    }
+
+    struct sigaction act;
+
+    sigemptyset(&act.sa_mask);
+    /* SA_NODEFER to disables adding the signal to the signal mask of the
+     * calling process on entry to the signal handler unless it is included in the sa_mask field. */
+    /* SA_SIGINFO flag is set to raise the function defined in sa_sigaction.
+     * Otherwise, sa_handler is used. */
+    act.sa_flags = SA_NODEFER | SA_SIGINFO;
+    act.sa_sigaction = sigsegvHandler;
+    if(server.crashlog_enabled) {
+        sigaction(SIGSEGV, &act, NULL);
+        sigaction(SIGBUS, &act, NULL);
+        sigaction(SIGFPE, &act, NULL);
+        sigaction(SIGILL, &act, NULL);
+        sigaction(SIGABRT, &act, NULL);
+    }
+}
+
+void removeSigSegvHandlers(void) {
+    struct sigaction act;
+    sigemptyset(&act.sa_mask);
+    act.sa_flags = SA_NODEFER | SA_RESETHAND;
+    act.sa_handler = SIG_DFL;
+    sigaction(SIGSEGV, &act, NULL);
+    sigaction(SIGBUS, &act, NULL);
+    sigaction(SIGFPE, &act, NULL);
+    sigaction(SIGILL, &act, NULL);
+    sigaction(SIGABRT, &act, NULL);
+}
+
 void printCrashReport(void) {
     /* Log INFO and CLIENT LIST */
     logServerInfo();
@@ -2162,7 +2272,7 @@ void bugReportEnd(int killViaSignal, int sig) {
     /* Make sure we exit with the right signal at the end. So for instance
      * the core will be dumped if enabled. */
     sigemptyset (&act.sa_mask);
-    act.sa_flags = SA_NODEFER | SA_ONSTACK | SA_RESETHAND;
+    act.sa_flags = 0;
     act.sa_handler = SIG_DFL;
     sigaction (sig, &act, NULL);
     kill(getpid(),sig);
@@ -2227,7 +2337,7 @@ void watchdogScheduleSignal(int period) {
     it.it_interval.tv_usec = 0;
     setitimer(ITIMER_REAL, &it, NULL);
 }
-void applyWatchdogPeriod() {
+void applyWatchdogPeriod(void) {
     struct sigaction act;
 
     /* Disable watchdog when period is 0 */
