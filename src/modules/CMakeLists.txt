@@ -12,5 +12,5 @@ add_library(helloblock SHARED helloblock.c)
 set_target_properties(helloblock PROPERTIES PREFIX "" SUFFIX ".so")
 
 
-add_library(testmodule SHARED testmodule.c)
-set_target_properties(testmodule PROPERTIES PREFIX "" SUFFIX ".so")
+# add_library(testmodule SHARED testmodule.c)
+# set_target_properties(testmodule PROPERTIES PREFIX "" SUFFIX ".so")

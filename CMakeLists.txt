@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.27 FATAL_ERROR)
 project(redis VERSION 4.0)
 set(CMAKE_BUILD_TYPE "Debug")
 
@@ -59,7 +59,7 @@ set(SRC_SERVER_TMP
         src/crc16.c
         src/endianconv.c
         src/slowlog.c
-        src/scripting.c
+        # src/scripting.c
         src/bio.c
         src/rio.c
         src/rand.c
